@@ -1,7 +1,7 @@
 {
   "name": "aibow-backend",
   "version": "1.0.0",
-  "description": "Aibow Backend",
+  "description": "Aibow Love Sync Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
