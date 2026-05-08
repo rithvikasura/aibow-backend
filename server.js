@@ -1,195 +1,111 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+const io = new Server(server, { cors: { origin: "*" } });
+
+// Memory databases (In production, use MongoDB)
+let users = {}; // { username: { password, security... } }
+let sessions = {}; // { sessionId: username }
+let groups = {}; // { groupId: { admin, users: [], messages: [] } }
+
+// --- AUTH APIS ---
+
+// Register
+app.post('/api/register', (req, res) => {
+    const { username, password, securityQ1, securityA1, securityQ2, securityA2 } = req.body;
+    if (users[username]) return res.json({ success: false, message: "User already exists" });
+    
+    users[username] = { password, securityQ1, securityA1, securityQ2, securityA2 };
+    res.json({ success: true });
 });
 
-// Store groups
-const groups = new Map(); // groupId -> { messages, admin, users, videoId }
+// Login
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body;
+    if (users[username] && users[username].password === password) {
+        const sessionId = uuidv4();
+        sessions[sessionId] = username;
+        res.json({ success: true, sessionId, username });
+    } else {
+        res.json({ success: false, message: "Invalid username or password" });
+    }
+});
 
-// Helper functions
-function getGroup(groupId) {
-  if (!groups.has(groupId)) {
-    groups.set(groupId, {
-      messages: [],
-      admin: null,
-      users: new Set(),
-      videoId: null
-    });
-  }
-  return groups.get(groupId);
-}
+// Verify Session
+app.post('/api/verify', (req, res) => {
+    const { sessionId } = req.body;
+    if (sessions[sessionId]) {
+        res.json({ valid: true, username: sessions[sessionId] });
+    } else {
+        res.json({ valid: false });
+    }
+});
+
+// Search User Existence
+app.get('/user-exists', (req, res) => {
+    const { username } = req.query;
+    res.json({ exists: !!users[username] });
+});
+
+// Logout
+app.post('/api/logout', (req, res) => {
+    const { sessionId } = req.body;
+    delete sessions[sessionId];
+    res.json({ success: true });
+});
+
+// --- SOCKET.IO LOGIC ---
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+    console.log('User connected:', socket.id);
 
-  socket.on('create-group', ({ userId }) => {
-    const groupId = generateGroupId();
-    const group = getGroup(groupId);
-    group.admin = userId;
-    group.users.add(userId);
-    
-    socket.join(groupId);
-    socket.data.groupId = groupId;
-    socket.data.userId = userId;
-    
-    socket.emit('group-created', groupId);
-    io.to(groupId).emit('online-users', Array.from(group.users));
-    console.log(`Group created: ${groupId} by ${userId}`);
-  });
-
-  socket.on('join-group', ({ groupId, userId }) => {
-    if (!groupId) {
-      socket.emit('error', 'Invalid group ID');
-      return;
-    }
-    
-    const group = getGroup(groupId);
-    group.users.add(userId);
-    
-    socket.join(groupId);
-    socket.data.groupId = groupId;
-    socket.data.userId = userId;
-    
-    socket.emit('joined-group', groupId);
-    socket.emit('old-messages', group.messages);
-    
-    // Send current video if exists
-    if (group.videoId) {
-      socket.emit('sync-video', { videoId: group.videoId });
-    }
-    
-    io.to(groupId).emit('online-users', Array.from(group.users));
-    socket.emit('admin-status', group.admin === userId);
-    console.log(`${userId} joined group: ${groupId}`);
-  });
-
-  socket.on('check-admin', ({ groupId }) => {
-    const group = getGroup(groupId);
-    socket.emit('admin-status', group.admin === socket.data.userId);
-  });
-
-  socket.on('send-message', ({ groupId, msg }) => {
-    const group = getGroup(groupId);
-    group.messages.push(msg);
-    // Keep only last 100 messages
-    if (group.messages.length > 100) group.messages.shift();
-    io.to(groupId).emit('new-message', msg);
-  });
-
-  socket.on('play-video', ({ groupId, videoId }) => {
-    const group = getGroup(groupId);
-    if (group.admin === socket.data.userId) {
-      group.videoId = videoId;
-      io.to(groupId).emit('sync-video', { videoId });
-    }
-  });
-
-  socket.on('typing-start', ({ groupId, user }) => {
-    socket.to(groupId).emit('user-typing', { user });
-  });
-
-  socket.on('typing-stop', ({ groupId, user }) => {
-    socket.to(groupId).emit('user-typing-stop', { user });
-  });
-
-  socket.on('rename-user', ({ groupId, oldName, newName }) => {
-    const group = getGroup(groupId);
-    
-    // Update messages
-    group.messages.forEach(msg => {
-      if (msg.user === oldName) msg.user = newName;
+    socket.on('create-group', ({ userId }) => {
+        const id = Math.random().toString(36).substring(2, 8).toUpperCase();
+        groups[id] = { admin: socket.id, users: [{id: socket.id, name: userId}], messages: [] };
+        socket.join(id);
+        socket.emit('group-created', id);
+        io.to(id).emit('online-users', groups[id].users);
     });
-    
-    // Update admin if needed
-    if (group.admin === oldName) group.admin = newName;
-    
-    // Update users set
-    if (group.users.has(oldName)) {
-      group.users.delete(oldName);
-      group.users.add(newName);
-    }
-    
-    io.to(groupId).emit('user-renamed', { oldName, newName });
-    io.to(groupId).emit('online-users', Array.from(group.users));
-  });
 
-  socket.on('leave-group', ({ groupId, userId }) => {
-    const group = getGroup(groupId);
-    group.users.delete(userId);
-    socket.leave(groupId);
-    io.to(groupId).emit('online-users', Array.from(group.users));
-    
-    // If admin leaves, assign new admin
-    if (group.admin === userId && group.users.size > 0) {
-      const newAdmin = Array.from(group.users)[0];
-      group.admin = newAdmin;
-      io.to(groupId).emit('admin-status', false);
-      io.to(groupId).emit('new-admin', newAdmin);
-    }
-    
-    // Delete group if empty
-    if (group.users.size === 0) {
-      groups.delete(groupId);
-    }
-  });
+    socket.on('join-group', ({ groupId, userId }) => {
+        if (groups[groupId]) {
+            groups[groupId].users.push({id: socket.id, name: userId});
+            socket.join(groupId);
+            socket.emit('joined-group', groupId);
+            socket.emit('old-messages', groups[groupId].messages);
+            io.to(groupId).emit('online-users', groups[groupId].users);
+        }
+    });
 
-  socket.on('close-group', ({ groupId }) => {
-    const group = getGroup(groupId);
-    if (group.admin === socket.data.userId) {
-      io.to(groupId).emit('group-closed');
-      groups.delete(groupId);
-    }
-  });
+    socket.on('play-video', ({ groupId, videoId }) => {
+        if (groups[groupId]) {
+            io.to(groupId).emit('sync-video', { videoId });
+        }
+    });
 
-  socket.on('rejoin-group', ({ groupId, userId }) => {
-    if (groups.has(groupId)) {
-      const group = getGroup(groupId);
-      group.users.add(userId);
-      socket.join(groupId);
-      socket.data.groupId = groupId;
-      socket.data.userId = userId;
-      socket.emit('rejoin-group', groupId);
-      socket.emit('old-messages', group.messages);
-      io.to(groupId).emit('online-users', Array.from(group.users));
-      if (group.videoId) {
-        socket.emit('sync-video', { videoId: group.videoId });
-      }
-    }
-  });
+    socket.on('send-message', ({ groupId, msg }) => {
+        if (groups[groupId]) {
+            groups[groupId].messages.push(msg);
+            socket.to(groupId).emit('new-message', msg);
+        }
+    });
 
-  socket.on('disconnect', () => {
-    const groupId = socket.data.groupId;
-    const userId = socket.data.userId;
-    if (groupId && userId && groups.has(groupId)) {
-      const group = getGroup(groupId);
-      group.users.delete(userId);
-      io.to(groupId).emit('online-users', Array.from(group.users));
-      
-      if (group.users.size === 0) {
-        groups.delete(groupId);
-      }
-    }
-    console.log('User disconnected:', socket.id);
-  });
+    socket.on('disconnect', () => {
+        // Cleanup online users from groups
+        for (let id in groups) {
+            groups[id].users = groups[id].users.filter(u => u.id !== socket.id);
+            io.to(id).emit('online-users', groups[id].users);
+        }
+    });
 });
-
-function generateGroupId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
